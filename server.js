@@ -101,8 +101,8 @@ async function handleMessage(msg, socket, setImei) {
     const imei = parts[2];
     const bikeId = IMEI_MAP[imei];
     if (bikeId) {
-      const lat = parseFloat(parts[18]) || 0;
-      const lng = parseFloat(parts[17]) || 0;
+const lng = parseFloat(parts[18]) || 0;  // longitudine
+const lat = parseFloat(parts[19]) || 0;  // latitudine
       const speed = parseFloat(parts[14]) || 0;
       const battery = parseInt(parts[27]) || 0;
       console.log(`GPS ${bikeId}: ${lat},${lng} speed:${speed}`);

@@ -1,14 +1,17 @@
+
+Copia
+
 const net = require('net');
 const admin = require('firebase-admin');
-
+ 
 // Firebase init
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
-
+ 
 const PASSWORD = process.env.DEVICE_PASSWORD || 'nabe5';
 const TCP_PORT = process.env.PORT || 8020;
-
+ 
 // Mappa IMEI -> ID bici
 const IMEI_MAP = {
   '867689060859347': 'PED001', '867689060859412': 'PED002',
@@ -32,19 +35,19 @@ const IMEI_MAP = {
   '867689060868421': 'PED037', '867689060859958': 'PED038',
   '867689060850957': 'PED039', '867689060855915': 'PED040',
 };
-
+ 
 const clients = {}; // imei -> socket
-
+ 
 const server = net.createServer((socket) => {
   console.log('Nuova connessione:', socket.remoteAddress);
   let buffer = '';
   let deviceImei = null;
-
+ 
   socket.on('data', async (data) => {
     buffer += data.toString();
     const messages = buffer.split('$');
     buffer = messages.pop();
-
+ 
     for (const msg of messages) {
       if (!msg.trim()) continue;
       const full = msg.trim() + '$';
@@ -55,17 +58,17 @@ const server = net.createServer((socket) => {
       });
     }
   });
-
+ 
   socket.on('close', () => {
     if (deviceImei) {
       delete clients[deviceImei];
       console.log('Disconnesso:', deviceImei);
     }
   });
-
+ 
   socket.on('error', (err) => console.error('Socket error:', err.message));
 });
-
+ 
 async function handleMessage(msg, socket, setImei) {
   // Heartbeat +HBD
   if (msg.startsWith('+HBD:')) {
@@ -76,9 +79,7 @@ async function handleMessage(msg, socket, setImei) {
       setImei(imei);
       const bikeId = IMEI_MAP[imei];
       console.log(`HBD da ${bikeId || imei}`);
-      // Risponde al heartbeat
       socket.write(`+SHBD:${countNum}$`);
-      // Aggiorna Firestore
       if (bikeId) {
         await db.collection('bikes').doc(bikeId).set({
           imei, lastSeen: new Date().toISOString(), online: true,
@@ -88,21 +89,20 @@ async function handleMessage(msg, socket, setImei) {
           batteryPercent: parseInt(parts[5]) || 0,
           charging: parts[6] === '1',
         }, { merge: true });
-        // Controlla comandi pendenti
         await checkPendingCommands(bikeId, imei, socket);
       }
     }
     return;
   }
-
+ 
   // Report posizione +RESP:GTFRI
   if (msg.startsWith('+RESP:GTFRI')) {
     const parts = msg.replace('$', '').split(',');
     const imei = parts[2];
     const bikeId = IMEI_MAP[imei];
     if (bikeId) {
-const lng = parseFloat(parts[18]) || 0;  // longitudine
-const lat = parseFloat(parts[19]) || 0;  // latitudine
+      const lng = parseFloat(parts[18]) || 0;  // longitudine
+      const lat = parseFloat(parts[19]) || 0;  // latitudine
       const speed = parseFloat(parts[14]) || 0;
       const battery = parseInt(parts[27]) || 0;
       console.log(`GPS ${bikeId}: ${lat},${lng} speed:${speed}`);
@@ -113,13 +113,13 @@ const lat = parseFloat(parts[19]) || 0;  // latitudine
     }
     return;
   }
-
+ 
   // ACK comandi
   if (msg.startsWith('+ACK:')) {
     console.log('ACK ricevuto:', msg);
     return;
   }
-
+ 
   // Lock/Unlock response
   if (msg.startsWith('+RESP:GTLKS')) {
     const parts = msg.replace('$', '').split(',');
@@ -135,7 +135,7 @@ const lat = parseFloat(parts[19]) || 0;  // latitudine
     }
   }
 }
-
+ 
 async function checkPendingCommands(bikeId, imei, socket) {
   try {
     const cmdRef = db.collection('bikes').doc(bikeId).collection('commands');
@@ -149,9 +149,12 @@ async function checkPendingCommands(bikeId, imei, socket) {
       atCmd = `AT+GTRTO=${PASSWORD},15,,,,,,,,${sn}$`;
     } else if (cmd.type === 'lock') {
       atCmd = `AT+GTRTO=${PASSWORD},16,,,,,,,,${sn}$`;
+    } else if (cmd.type === 'beep') {
+      // Comando suona: accende il fanale anteriore per 3 secondi
+      atCmd = `AT+GTRTO=${PASSWORD},11,,,,,,,,${sn}$`;
     }
     if (atCmd) {
-      console.log(`Invio comando a ${bikeId}:`, atCmd);
+      console.log(`Invio comando ${cmd.type} a ${bikeId}:`, atCmd);
       socket.write(atCmd);
       await cmdDoc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
     }
@@ -159,7 +162,7 @@ async function checkPendingCommands(bikeId, imei, socket) {
     console.error('Errore comando:', e.message);
   }
 }
-
+ 
 // Listener Firestore per comandi real-time
 function watchCommands() {
   db.collectionGroup('commands').where('status', '==', 'pending')
@@ -176,7 +179,7 @@ function watchCommands() {
       });
     });
 }
-
+ 
 server.listen(TCP_PORT, () => {
   console.log(`Server TCP in ascolto sulla porta ${TCP_PORT}`);
   watchCommands();

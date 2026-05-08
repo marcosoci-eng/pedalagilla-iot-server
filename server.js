@@ -98,15 +98,44 @@ async function handleMessage(msg, socket, setImei) {
     const imei = parts[2];
     const bikeId = IMEI_MAP[imei];
     if (bikeId) {
-      const lng = parseFloat(parts[18]) || 0;  // longitudine
-      const lat = parseFloat(parts[19]) || 0;  // latitudine
+      const lng = parseFloat(parts[18]) || 0;
+      const lat = parseFloat(parts[19]) || 0;
       const speed = parseFloat(parts[14]) || 0;
       const battery = parseInt(parts[27]) || 0;
       console.log(`GPS ${bikeId}: ${lat},${lng} speed:${speed}`);
+      
+      // Aggiorna posizione bici su Firebase
       await db.collection('bikes').doc(bikeId).set({
         lat, lng, speed, battery,
         lastGPS: new Date().toISOString(),
       }, { merge: true });
+
+      // Aggiorna tracciato sulla corsa attiva
+      if (lat && lng && lat !== 0 && lng !== 0 && lng < 180) {
+        try {
+          const paId = 'PA-' + bikeId.replace('PED', '');
+          // Controlla se la bici è in uso
+          const statusDoc = await db.collection('bikesStatus').doc(paId).get();
+          if (statusDoc.exists && statusDoc.data().inUse) {
+            const userId = statusDoc.data().userId;
+            // Cerca la corsa attiva
+            const ridesSnap = await db.collection('rides')
+              .where('userId', '==', userId)
+              .where('status', '==', 'In corso')
+              .limit(1)
+              .get();
+            if (!ridesSnap.empty) {
+              const rideDoc = ridesSnap.docs[0];
+              const currentTrack = rideDoc.data().track || [];
+              const newPoint = { lat, lng, t: Date.now() };
+              await rideDoc.ref.update({ track: [...currentTrack, newPoint] });
+              console.log(`📍 Track IoT aggiornato: ${rideDoc.id} → ${lat},${lng}`);
+            }
+          }
+        } catch(e) {
+          console.error('Errore track IoT:', e.message);
+        }
+      }
     }
     return;
   }

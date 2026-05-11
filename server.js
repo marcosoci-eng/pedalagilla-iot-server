@@ -177,6 +177,8 @@ async function checkPendingCommands(bikeId, imei, socket) {
       atCmd = `AT+GTRTO=${PASSWORD},16,,,,,,,,${sn}$`;
     } else if (cmd.type === 'beep') {
       atCmd = `AT+GTRTO=${PASSWORD},11,,,,,,,,${sn}$`;
+    } else if (cmd.type === 'battery_open') {
+      atCmd = `AT+GTRTO=${PASSWORD},12,,,,,,,,${sn}$`;
     }
     if (atCmd) {
       console.log(`Invio comando ${cmd.type} a ${bikeId}:`, atCmd);
@@ -211,4 +213,43 @@ function watchCommands() {
 server.listen(TCP_PORT, () => {
   console.log(`Server TCP in ascolto sulla porta ${TCP_PORT}`);
   watchCommands();
+  autoLockInactive();
 });
+
+// Auto-blocco bici ferme da più di 4 ore dopo fine corsa
+async function autoLockInactive() {
+  const CHECK_INTERVAL = 30 * 60 * 1000; // controlla ogni 30 minuti
+  const LOCK_AFTER_MS = 4 * 60 * 60 * 1000; // 4 ore
+
+  const check = async () => {
+    try {
+      const snap = await db.collection('bikesStatus').get();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        if (data.inUse) continue; // in uso, skip
+        const updatedAt = data.updatedAt ? new Date(data.updatedAt).getTime() : 0;
+        const elapsed = Date.now() - updatedAt;
+        if (elapsed > LOCK_AFTER_MS) {
+          // Cerca l'IMEI della bici
+          const bikeId = doc.id; // es. PA-027
+          const pedId = 'PED' + bikeId.replace('PA-','').replace('-','');
+          const bikeDoc = await db.collection('bikes').doc(pedId).get();
+          const imei = bikeDoc.data()?.imei;
+          if (imei && clients[imei]) {
+            console.log(`🔒 Auto-blocco ${bikeId} — ferma da ${Math.round(elapsed/3600000)}h`);
+            const sn = Math.floor(Math.random() * 0xFFFF).toString(16).toUpperCase().padStart(4,'0');
+            clients[imei].write(`AT+GTRTO=${PASSWORD},16,,,,,,,,${sn}$`);
+          }
+        }
+      }
+    } catch(e) {
+      console.error('Errore auto-lock:', e.message);
+    }
+  };
+
+  // Prima esecuzione dopo 5 minuti, poi ogni 30 minuti
+  setTimeout(() => {
+    check();
+    setInterval(check, CHECK_INTERVAL);
+  }, 5 * 60 * 1000);
+}

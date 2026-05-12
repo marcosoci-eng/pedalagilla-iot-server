@@ -170,15 +170,22 @@ async function checkPendingCommands(bikeId, imei, socket) {
     if (!pendingDoc) return;
     const cmd = pendingDoc.data();
     let atCmd = '';
-    const sn = Math.floor(Math.random() * 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
     if (cmd.type === 'unlock') {
-      atCmd = `AT+GTRTO=${PASSWORD},15,,,,,,,,${sn}$`;
+      atCmd = `AT+GTRTO=${PASSWORD},15,,,,,,,,FFFF$`;
     } else if (cmd.type === 'lock') {
-      atCmd = `AT+GTRTO=${PASSWORD},16,,,,,,,,${sn}$`;
+      atCmd = `AT+GTRTO=${PASSWORD},16,,,,,,,,FFFF$`;
     } else if (cmd.type === 'beep') {
-      atCmd = `AT+GTRTO=${PASSWORD},11,,,,,,,,${sn}$`;
+      // Comando corretto confermato da Navee
+      atCmd = `AT+GTRTO=${PASSWORD},11,,,,,,,,FFFF$`;
     } else if (cmd.type === 'battery_open') {
-      atCmd = `AT+GTRTO=${PASSWORD},12,,,,,,,,${sn}$`;
+      // Comando corretto confermato da Navee (era 12, corretto è 21)
+      atCmd = `AT+GTRTO=${PASSWORD},21,,0,,,,,,FFFF$`;
+    } else if (cmd.type === 'gps_high') {
+      // Alta frequenza GPS: ogni 10 secondi in movimento - confermato da Navee
+      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,10,240,,,,,,FFFF$`;
+    } else if (cmd.type === 'gps_normal') {
+      // Ritorna a frequenza normale: ogni 30 secondi
+      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;
     }
     if (atCmd) {
       console.log(`Invio comando ${cmd.type} a ${bikeId}:`, atCmd);

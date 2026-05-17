@@ -1,13 +1,13 @@
 const net = require('net');
 const admin = require('firebase-admin');
 
-// Firebase init
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const PASSWORD = process.env.DEVICE_PASSWORD || 'nabe5';
 const TCP_PORT = process.env.PORT || 8020;
+const AUTO_PAUSE_MINUTES = 15; // minuti fermi prima dell'auto-pausa
 
 const IMEI_MAP = {
   '867689060859347': 'PED001', '867689060859412': 'PED002',
@@ -32,9 +32,8 @@ const IMEI_MAP = {
   '867689060850957': 'PED039', '867689060855915': 'PED040',
 };
 
-const clients = {}; // imei -> socket
+const clients = {};
 
-// ─── Mappa AT commands ───────────────────────────────────────────────────────
 function buildAtCmd(type) {
   switch(type) {
     case 'unlock':       return `AT+GTRTO=${PASSWORD},15,,,,,,,,FFFF$`;
@@ -73,7 +72,7 @@ const server = net.createServer((socket) => {
 });
 
 async function handleMessage(msg, socket, setImei) {
-  // Heartbeat +HBD
+  // Heartbeat
   if (msg.startsWith('+HBD:')) {
     const parts = msg.replace('$', '').split(',');
     const imei = parts[1];
@@ -91,14 +90,13 @@ async function handleMessage(msg, socket, setImei) {
           signal: parseInt(parts[4]) || 0,
           charging: parts[6] === '1',
         }, { merge: true });
-        // Controlla comandi pending solo se non arriva uno snapshot live
         await checkPendingCommands(bikeId, imei, socket);
       }
     }
     return;
   }
 
-  // Posizione GPS +RESP:GTFRI
+  // Posizione GPS
   if (msg.startsWith('+RESP:GTFRI')) {
     const parts = msg.replace('$', '').split(',');
     const imei = parts[2];
@@ -108,8 +106,55 @@ async function handleMessage(msg, socket, setImei) {
       const lat = parseFloat(parts[19]) || 0;
       const speed = parseFloat(parts[14]) || 0;
       const battery = parseInt(parts[27]) || 0;
+      const now = new Date().toISOString();
       console.log(`GPS ${bikeId}: ${lat},${lng} speed:${speed}`);
-      await db.collection('bikes').doc(bikeId).set({ lat, lng, speed, battery, lastGPS: new Date().toISOString() }, { merge: true });
+
+      // Aggiorna posizione
+      const updateData = { lat, lng, speed, battery, lastGPS: now };
+
+      // Aggiorna lastMovedAt solo se la bici si sta muovendo
+      if (speed > 1) {
+        updateData.lastMovedAt = now;
+        updateData.autoPause = false; // si è rimessa in moto — cancella auto-pausa
+      } else {
+        // Fermo: controlla se è ora di mettere in auto-pausa
+        updateData.lastStoppedAt = now;
+      }
+
+      await db.collection('bikes').doc(bikeId).set(updateData, { merge: true });
+
+      // ── AUTO-PAUSA dopo 15 minuti fermi durante una corsa ──
+      if (speed <= 1) {
+        try {
+          const paId = 'PA-' + bikeId.replace('PED', '');
+          const statusDoc = await db.collection('bikesStatus').doc(paId).get();
+          if (statusDoc.exists && statusDoc.data().inUse) {
+            // Legge lastMovedAt dalla bici
+            const bikeDoc = await db.collection('bikes').doc(bikeId).get();
+            const bikeData = bikeDoc.data();
+            const lastMoved = bikeData.lastMovedAt ? new Date(bikeData.lastMovedAt).getTime() : null;
+            const alreadyAutoPaused = bikeData.autoPause === true;
+
+            if (!alreadyAutoPaused && lastMoved) {
+              const minutesFermo = (Date.now() - lastMoved) / 60000;
+              if (minutesFermo >= AUTO_PAUSE_MINUTES) {
+                console.log(`⏸️ AUTO-PAUSA ${bikeId} — ferma da ${Math.round(minutesFermo)} min`);
+                // Scrive autoPause:true — l'app lo legge e mette in pausa il timer
+                await db.collection('bikes').doc(bikeId).set(
+                  { autoPause: true, autoPausedAt: now },
+                  { merge: true }
+                );
+                // Blocca fisicamente la bici
+                if (clients[bikeData.imei]) {
+                  clients[bikeData.imei].write(buildAtCmd('lock'));
+                }
+              }
+            }
+          }
+        } catch(e) { console.error('Errore auto-pausa:', e.message); }
+      }
+
+      // Aggiorna tracciato corsa attiva
       if (lat && lng && Math.abs(lat) > 0 && Math.abs(lng) < 180) {
         try {
           const paId = 'PA-' + bikeId.replace('PED', '');
@@ -140,20 +185,23 @@ async function handleMessage(msg, socket, setImei) {
     const bikeId = IMEI_MAP[imei];
     if (bikeId) {
       const locked = parts[5] === '10';
-      await db.collection('bikes').doc(bikeId).set({ locked, lastLockEvent: new Date().toISOString() }, { merge: true });
+      await db.collection('bikes').doc(bikeId).set(
+        { locked, lastLockEvent: new Date().toISOString() },
+        { merge: true }
+      );
     }
   }
 }
 
 async function checkPendingCommands(bikeId, imei, socket) {
   try {
-    const cmdRef = db.collection('bikes').doc(bikeId).collection('commands');
-    const snap = await cmdRef.where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(3).get();
+    const snap = await db.collection('bikes').doc(bikeId).collection('commands')
+      .where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(3).get();
     for (const doc of snap.docs) {
       const cmd = doc.data();
       const atCmd = buildAtCmd(cmd.type);
       if (atCmd) {
-        console.log(`→ CMD ${cmd.type} a ${bikeId}:`, atCmd);
+        console.log(`→ CMD ${cmd.type} a ${bikeId}`);
         socket.write(atCmd);
         await doc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
       } else {
@@ -164,33 +212,29 @@ async function checkPendingCommands(bikeId, imei, socket) {
 }
 
 function watchCommands() {
-  // ── FIX VELOCITÀ: invio immediato quando arriva comando pending ──
-  // Non aspettiamo il prossimo HBD — mandiamo subito se la bici è connessa
   db.collectionGroup('commands').onSnapshot(snapshot => {
     snapshot.docChanges().forEach(async (change) => {
       if (change.type !== 'added') return;
       const data = change.doc.data();
       if (data.status !== 'pending') return;
 
-      const bikeId = change.doc.ref.parent.parent.id; // es. PED027
+      const bikeId = change.doc.ref.parent.parent.id;
       const bikeDoc = await db.collection('bikes').doc(bikeId).get().catch(()=>null);
       const imei = bikeDoc?.data()?.imei;
 
       if (!imei || !clients[imei]) {
-        console.log(`CMD ${data.type} per ${bikeId}: bici non connessa (imei:${imei||'?'})`);
+        console.log(`CMD ${data.type} per ${bikeId}: offline`);
         return;
       }
 
       const atCmd = buildAtCmd(data.type);
-      if (!atCmd) { console.log(`CMD tipo sconosciuto: ${data.type}`); return; }
+      if (!atCmd) return;
 
-      // Piccolo delay per evitare race condition con scrittura Firestore
       setTimeout(async () => {
         try {
-          // Riverifica che sia ancora pending (evita doppio invio)
           const fresh = await change.doc.ref.get();
           if (fresh.data()?.status !== 'pending') return;
-          console.log(`⚡ IMMEDIATO ${data.type} → ${bikeId}:`, atCmd);
+          console.log(`⚡ IMMEDIATO ${data.type} → ${bikeId}`);
           clients[imei].write(atCmd);
           await change.doc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
         } catch(e) { console.error('Errore invio immediato:', e.message); }
@@ -218,10 +262,10 @@ async function autoLockInactive() {
         if (elapsed > LOCK_AFTER_MS) {
           const pedId = 'PED' + doc.id.replace('PA-','');
           const bikeDoc = await db.collection('bikes').doc(pedId).get();
-          const imei = bikeDoc.data()?.imei;
-          if (imei && clients[imei]) {
-            console.log(`🔒 Auto-blocco ${doc.id}`);
-            clients[imei].write(`AT+GTRTO=${PASSWORD},16,,,,,,,,FFFF$`);
+          const bData = bikeDoc.data();
+          if (bData?.imei && clients[bData.imei]) {
+            console.log(`🔒 Auto-lock ${doc.id}`);
+            clients[bData.imei].write(buildAtCmd('lock'));
           }
         }
       }

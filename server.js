@@ -26,6 +26,65 @@ async function stripeRequest(endpoint, params) {
   return res.json();
 }
 
+// ─── HELPER GEOFENCE ─────────────────────────────────────────────────────────
+function haversineDist(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const dLat = (lat2-lat1)*Math.PI/180;
+  const dLng = (lng2-lng1)*Math.PI/180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// Carica le zone operative da Firestore (aggiornate ogni 5 min)
+let operativeZones = [];
+async function loadOperativeZones() {
+  try {
+    const snap = await db.collection('config').doc('zones').get();
+    if (snap.exists) {
+      const all = snap.data().zones || [];
+      operativeZones = all.filter(z => z.type === 'operativa' && z.center && z.radius);
+      console.log(`📍 Zone operative caricate: ${operativeZones.length}`);
+    }
+  } catch(e) { console.error('Errore caricamento zone:', e.message); }
+}
+setInterval(loadOperativeZones, 5 * 60 * 1000); // ricarica ogni 5 min
+
+function isInsideOperativeZone(lat, lng) {
+  if (operativeZones.length === 0) return true; // se non ci sono zone, non bloccare
+  return operativeZones.some(z => haversineDist(lat, lng, z.center.lat, z.center.lng) <= z.radius);
+}
+
+// Traccia bici fuori zona per il beep ripetuto
+const outOfZoneBeepIntervals = {}; // bikeId -> intervalId
+
+function startOutOfZoneAlarm(bikeId, socket) {
+  if (outOfZoneBeepIntervals[bikeId]) return; // già attivo
+  console.log(`🚨 Allarme fuori zona avviato: ${bikeId}`);
+  // Primo lock + beep immediato
+  socket.write(buildAtCmd('lock'));
+  socket.write(buildAtCmd('beep'));
+  // Poi ogni 60 secondi
+  outOfZoneBeepIntervals[bikeId] = setInterval(() => {
+    if (clients[Object.keys(clients).find(imei => IMEI_MAP[imei] === bikeId)]) {
+      const imei = Object.keys(clients).find(i => IMEI_MAP[i] === bikeId);
+      if (imei && clients[imei]) {
+        clients[imei].write(buildAtCmd('lock'));
+        clients[imei].write(buildAtCmd('beep'));
+        console.log(`🔔 Beep fuori zona: ${bikeId}`);
+      }
+    }
+  }, 60 * 1000);
+}
+
+function stopOutOfZoneAlarm(bikeId) {
+  if (outOfZoneBeepIntervals[bikeId]) {
+    clearInterval(outOfZoneBeepIntervals[bikeId]);
+    delete outOfZoneBeepIntervals[bikeId];
+    console.log(`✅ Allarme fuori zona fermato: ${bikeId}`);
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── IMEI MAP ────────────────────────────────────────────────────────────────
 const IMEI_MAP = {
   '867689060859347': 'PED001', '867689060859412': 'PED002',
@@ -61,6 +120,7 @@ function buildAtCmd(type) {
     case 'battery_open': return `AT+GTRTO=${PASSWORD},21,,0,,,,,,FFFF$`;
     case 'gps_high':     return `AT+GTFRI=${PASSWORD},1,0,300,60,240,,,,,,FFFF$`;
     case 'gps_normal':   return `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;
+    case 'stop_alarm':   return null; // gestito lato server (stopOutOfZoneAlarm)
     default: return null;
   }
 }
@@ -244,6 +304,32 @@ async function handleMessage(msg, socket, setImei) {
       const battery = parseInt(parts[27]) || 0;
       await db.collection('bikes').doc(bikeId).set({ lat, lng, speed, battery, lastGPS: new Date().toISOString() }, { merge: true });
 
+      // ── Check zona operativa ─────────────────────────────────────────────────
+      if (lat && lng && Math.abs(lat) > 0 && Math.abs(lng) > 0) {
+        const inside = isInsideOperativeZone(lat, lng);
+        const bikeDoc2 = await db.collection('bikes').doc(bikeId).get().catch(()=>null);
+        const wasOutOfZone = bikeDoc2?.data()?.outOfZone || false;
+
+        if (!inside) {
+          // Fuori zona — aggiorna stato e avvia allarme
+          await db.collection('bikes').doc(bikeId).update({
+            outOfZone: true,
+            outOfZoneAt: wasOutOfZone ? (bikeDoc2?.data()?.outOfZoneAt || new Date().toISOString()) : new Date().toISOString()
+          });
+          // Avvia allarme (lock + beep ogni 60s)
+          startOutOfZoneAlarm(bikeId, socket);
+        } else if (wasOutOfZone) {
+          // Rientrata in zona — ferma allarme
+          await db.collection('bikes').doc(bikeId).update({
+            outOfZone: false,
+            outOfZoneAt: null
+          });
+          stopOutOfZoneAlarm(bikeId);
+          console.log(`✅ ${bikeId} rientrata in zona operativa`);
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────────
+
       // Auto-pausa dopo 15 min ferma
       if (lat && lng) {
         try {
@@ -301,7 +387,15 @@ async function checkPendingCommands(bikeId, imei, socket) {
     const snap = await db.collection('bikes').doc(bikeId).collection('commands')
       .where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(3).get();
     for (const doc of snap.docs) {
-      const atCmd = buildAtCmd(doc.data().type);
+      const cmdType = doc.data().type;
+      if (cmdType === 'stop_alarm') {
+        // Ferma allarme fuori zona manualmente
+        stopOutOfZoneAlarm(bikeId);
+        await doc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
+        console.log(`🛑 Allarme fermato manualmente: ${bikeId}`);
+        continue;
+      }
+      const atCmd = buildAtCmd(cmdType);
       if (atCmd) {
         socket.write(atCmd);
         await doc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
@@ -337,6 +431,7 @@ function watchCommands() {
 
 server.listen(TCP_PORT, () => {
   console.log(`TCP IoT porta ${TCP_PORT}`);
+  loadOperativeZones(); // carica zone operative subito
   watchCommands();
   autoLockInactive();
 });

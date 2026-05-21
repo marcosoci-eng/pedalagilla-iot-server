@@ -1,14 +1,32 @@
 const net = require('net');
+const http = require('http');
 const admin = require('firebase-admin');
 
+// Firebase init
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const PASSWORD = process.env.DEVICE_PASSWORD || 'nabe5';
 const TCP_PORT = process.env.PORT || 8020;
-const AUTO_PAUSE_MINUTES = 15; // minuti fermi prima dell'auto-pausa
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const APP_URL = 'https://www.pedalagilla.it';
 
+// Stripe via fetch (no dipendenza npm aggiuntiva)
+async function stripeRequest(endpoint, params) {
+  const body = new URLSearchParams(params).toString();
+  const res = await fetch(`https://api.stripe.com/v1/${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body,
+  });
+  return res.json();
+}
+
+// ─── IMEI MAP ────────────────────────────────────────────────────────────────
 const IMEI_MAP = {
   '867689060859347': 'PED001', '867689060859412': 'PED002',
   '867689060842285': 'PED003', '867689060851666': 'PED004',
@@ -34,6 +52,7 @@ const IMEI_MAP = {
 
 const clients = {};
 
+// ─── AT COMMANDS ─────────────────────────────────────────────────────────────
 function buildAtCmd(type) {
   switch(type) {
     case 'unlock':       return `AT+GTRTO=${PASSWORD},15,,,,,,,,FFFF$`;
@@ -46,6 +65,126 @@ function buildAtCmd(type) {
   }
 }
 
+// ─── HTTP SERVER (Stripe Checkout + Webhook) ──────────────────────────────────
+const httpServer = http.createServer(async (req, res) => {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', APP_URL);
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+
+  let body = '';
+  req.on('data', chunk => body += chunk);
+  req.on('end', async () => {
+    try {
+      // ── POST /create-checkout ─────────────────────────────────────────────
+      if (req.method === 'POST' && req.url === '/create-checkout') {
+        const data = JSON.parse(body);
+        const { amount, planLabel, bikeIds, userId, userName, userEmail, plan } = data;
+
+        // Crea sessione Stripe Checkout
+        const params = {
+          'payment_method_types[]': 'card',
+          'line_items[0][price_data][currency]': 'eur',
+          'line_items[0][price_data][product_data][name]': `PedalAgilla — ${planLabel}`,
+          'line_items[0][price_data][product_data][description]': `Bici: ${bikeIds.join(', ')}`,
+          'line_items[0][price_data][unit_amount]': Math.round(amount * 100), // centesimi
+          'line_items[0][quantity]': '1',
+          'mode': 'payment',
+          'customer_email': userEmail || '',
+          'success_url': `${APP_URL}/?checkout_success=true&session_id={CHECKOUT_SESSION_ID}`,
+          'cancel_url': `${APP_URL}/?checkout_cancelled=true`,
+          'metadata[userId]': userId || '',
+          'metadata[userName]': userName || '',
+          'metadata[bikeIds]': bikeIds.join(','),
+          'metadata[plan]': plan || 'minuti',
+          'payment_intent_data[capture_method]': 'automatic',
+        };
+
+        // Pre-autorizzazione per piani a consumo (non giornata/settimana)
+        if (plan === 'minuti') {
+          params['payment_intent_data[capture_method]'] = 'manual'; // autorizza, non addebita subito
+        }
+
+        const session = await stripeRequest('checkout/sessions', params);
+
+        if (session.error) {
+          res.writeHead(400, {'Content-Type': 'application/json'});
+          res.end(JSON.stringify({ error: session.error.message }));
+          return;
+        }
+
+        // Salva la sessione su Firestore per ricollegarla alla corsa
+        await db.collection('checkoutSessions').doc(session.id).set({
+          userId, userName, userEmail,
+          bikeIds, plan, amount,
+          status: 'pending',
+          createdAt: new Date().toISOString(),
+        });
+
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({ url: session.url, sessionId: session.id }));
+        return;
+      }
+
+      // ── POST /checkout-status ─────────────────────────────────────────────
+      // L'app chiama questo dopo il redirect success per verificare il pagamento
+      if (req.method === 'POST' && req.url === '/checkout-status') {
+        const { sessionId } = JSON.parse(body);
+        const response = await fetch(`https://api.stripe.com/v1/checkout/sessions/${sessionId}`, {
+          headers: { 'Authorization': `Bearer ${STRIPE_SECRET_KEY}` }
+        });
+        const session = await response.json();
+
+        if (session.payment_status === 'paid' || session.payment_status === 'no_payment_required') {
+          // Aggiorna la sessione su Firestore
+          await db.collection('checkoutSessions').doc(sessionId).update({
+            status: 'paid',
+            paymentIntentId: session.payment_intent,
+            paidAt: new Date().toISOString(),
+          });
+
+          res.writeHead(200, {'Content-Type': 'application/json'});
+          res.end(JSON.stringify({
+            paid: true,
+            metadata: session.metadata,
+            paymentIntentId: session.payment_intent,
+          }));
+        } else {
+          res.writeHead(200, {'Content-Type': 'application/json'});
+          res.end(JSON.stringify({ paid: false, status: session.payment_status }));
+        }
+        return;
+      }
+
+      // ── POST /capture-payment ─────────────────────────────────────────────
+      // Chiamato a fine corsa per addebitare l'importo finale (piano minuti)
+      if (req.method === 'POST' && req.url === '/capture-payment') {
+        const { paymentIntentId, finalAmount } = JSON.parse(body);
+        const session = await stripeRequest(`payment_intents/${paymentIntentId}/capture`, {
+          'amount_to_capture': Math.round(finalAmount * 100),
+        });
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({ success: !session.error, session }));
+        return;
+      }
+
+      res.writeHead(404); res.end('Not found');
+    } catch(e) {
+      console.error('HTTP error:', e.message);
+      res.writeHead(500, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({ error: e.message }));
+    }
+  });
+});
+
+// HTTP su porta 3000 (Railway gestisce il routing)
+const HTTP_PORT = 3000;
+httpServer.listen(HTTP_PORT, () => {
+  console.log(`HTTP server (Stripe Checkout) porta ${HTTP_PORT}`);
+});
+
+// ─── TCP SERVER (IoT bici) ────────────────────────────────────────────────────
 const server = net.createServer((socket) => {
   console.log('Nuova connessione:', socket.remoteAddress);
   let buffer = '';
@@ -67,12 +206,10 @@ const server = net.createServer((socket) => {
   socket.on('close', () => {
     if (deviceImei) { delete clients[deviceImei]; console.log('Disconnesso:', deviceImei); }
   });
-
   socket.on('error', (err) => console.error('Socket error:', err.message));
 });
 
 async function handleMessage(msg, socket, setImei) {
-  // Heartbeat
   if (msg.startsWith('+HBD:')) {
     const parts = msg.replace('$', '').split(',');
     const imei = parts[1];
@@ -96,7 +233,6 @@ async function handleMessage(msg, socket, setImei) {
     return;
   }
 
-  // Posizione GPS
   if (msg.startsWith('+RESP:GTFRI')) {
     const parts = msg.replace('$', '').split(',');
     const imei = parts[2];
@@ -106,88 +242,55 @@ async function handleMessage(msg, socket, setImei) {
       const lat = parseFloat(parts[19]) || 0;
       const speed = parseFloat(parts[14]) || 0;
       const battery = parseInt(parts[27]) || 0;
-      const now = new Date().toISOString();
-      console.log(`GPS ${bikeId}: ${lat},${lng} speed:${speed}`);
+      await db.collection('bikes').doc(bikeId).set({ lat, lng, speed, battery, lastGPS: new Date().toISOString() }, { merge: true });
 
-      // Aggiorna posizione
-      const updateData = { lat, lng, speed, battery, lastGPS: now };
-
-      // Aggiorna lastMovedAt solo se la bici si sta muovendo
-      if (speed > 1) {
-        updateData.lastMovedAt = now;
-        updateData.autoPause = false; // si è rimessa in moto — cancella auto-pausa
-      } else {
-        // Fermo: controlla se è ora di mettere in auto-pausa
-        updateData.lastStoppedAt = now;
-      }
-
-      await db.collection('bikes').doc(bikeId).set(updateData, { merge: true });
-
-      // ── AUTO-PAUSA dopo 15 minuti fermi durante una corsa ──
-      if (speed <= 1) {
+      // Auto-pausa dopo 15 min ferma
+      if (lat && lng) {
         try {
+          const bikeDoc = await db.collection('bikes').doc(bikeId).get();
+          const bikeData = bikeDoc.data() || {};
           const paId = 'PA-' + bikeId.replace('PED', '');
           const statusDoc = await db.collection('bikesStatus').doc(paId).get();
-          if (statusDoc.exists && statusDoc.data().inUse) {
-            // Legge lastMovedAt dalla bici
-            const bikeDoc = await db.collection('bikes').doc(bikeId).get();
-            const bikeData = bikeDoc.data();
-            const lastMoved = bikeData.lastMovedAt ? new Date(bikeData.lastMovedAt).getTime() : null;
-            const alreadyAutoPaused = bikeData.autoPause === true;
-
-            if (!alreadyAutoPaused && lastMoved) {
-              const minutesFermo = (Date.now() - lastMoved) / 60000;
-              if (minutesFermo >= AUTO_PAUSE_MINUTES) {
-                console.log(`⏸️ AUTO-PAUSA ${bikeId} — ferma da ${Math.round(minutesFermo)} min`);
-                // Scrive autoPause:true — l'app lo legge e mette in pausa il timer
-                await db.collection('bikes').doc(bikeId).set(
-                  { autoPause: true, autoPausedAt: now },
-                  { merge: true }
-                );
-                // Blocca fisicamente la bici
-                if (clients[bikeData.imei]) {
-                  clients[bikeData.imei].write(buildAtCmd('lock'));
-                }
-              }
+          if (statusDoc.exists && statusDoc.data().inUse && speed <= 1) {
+            const lastMoved = bikeData.lastMovedAt ? new Date(bikeData.lastMovedAt).getTime() : Date.now();
+            const minutesFermo = (Date.now() - lastMoved) / 60000;
+            if (minutesFermo >= 15 && !bikeData.autoPause) {
+              console.log(`⏸️ Auto-pausa ${bikeId} — fermo da ${Math.round(minutesFermo)} min`);
+              socket.write(buildAtCmd('lock'));
+              await db.collection('bikes').doc(bikeId).update({ autoPause: true });
             }
+          } else if (speed > 1) {
+            await db.collection('bikes').doc(bikeId).update({ lastMovedAt: new Date().toISOString() });
           }
-        } catch(e) { console.error('Errore auto-pausa:', e.message); }
-      }
+        } catch(e) { console.error('Auto-pausa error:', e.message); }
 
-      // Aggiorna tracciato corsa attiva
-      if (lat && lng && Math.abs(lat) > 0 && Math.abs(lng) < 180) {
+        // Aggiorna tracciato corsa
         try {
           const paId = 'PA-' + bikeId.replace('PED', '');
           const statusDoc = await db.collection('bikesStatus').doc(paId).get();
           if (statusDoc.exists && statusDoc.data().inUse) {
-            const userId = statusDoc.data().userId;
             const ridesSnap = await db.collection('rides')
-              .where('userId', '==', userId)
-              .where('status', '==', 'In corso')
-              .limit(1).get();
+              .where('userId', '==', statusDoc.data().userId)
+              .where('status', '==', 'In corso').limit(1).get();
             if (!ridesSnap.empty) {
-              const rideDoc = ridesSnap.docs[0];
-              const track = rideDoc.data().track || [];
-              await rideDoc.ref.update({ track: [...track, { lat, lng, t: Date.now() }] });
+              const track = ridesSnap.docs[0].data().track || [];
+              await ridesSnap.docs[0].ref.update({ track: [...track, { lat, lng, t: Date.now() }] });
             }
           }
-        } catch(e) { console.error('Errore track IoT:', e.message); }
+        } catch(e) { console.error('Track error:', e.message); }
       }
     }
     return;
   }
 
   if (msg.startsWith('+ACK:')) { console.log('ACK:', msg.slice(0,60)); return; }
-
   if (msg.startsWith('+RESP:GTLKS')) {
     const parts = msg.replace('$', '').split(',');
     const imei = parts[2];
     const bikeId = IMEI_MAP[imei];
     if (bikeId) {
-      const locked = parts[5] === '10';
       await db.collection('bikes').doc(bikeId).set(
-        { locked, lastLockEvent: new Date().toISOString() },
-        { merge: true }
+        { locked: parts[5] === '10', lastLockEvent: new Date().toISOString() }, { merge: true }
       );
     }
   }
@@ -198,60 +301,47 @@ async function checkPendingCommands(bikeId, imei, socket) {
     const snap = await db.collection('bikes').doc(bikeId).collection('commands')
       .where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(3).get();
     for (const doc of snap.docs) {
-      const cmd = doc.data();
-      const atCmd = buildAtCmd(cmd.type);
+      const atCmd = buildAtCmd(doc.data().type);
       if (atCmd) {
-        console.log(`→ CMD ${cmd.type} a ${bikeId}`);
         socket.write(atCmd);
         await doc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
       } else {
         await doc.ref.update({ status: 'unknown_type' });
       }
     }
-  } catch (e) { console.error('Errore checkPendingCommands:', e.message); }
+  } catch(e) { console.error('checkPendingCommands:', e.message); }
 }
 
 function watchCommands() {
   db.collectionGroup('commands').onSnapshot(snapshot => {
     snapshot.docChanges().forEach(async (change) => {
-      if (change.type !== 'added') return;
-      const data = change.doc.data();
-      if (data.status !== 'pending') return;
-
+      if (change.type !== 'added' || change.doc.data().status !== 'pending') return;
       const bikeId = change.doc.ref.parent.parent.id;
       const bikeDoc = await db.collection('bikes').doc(bikeId).get().catch(()=>null);
       const imei = bikeDoc?.data()?.imei;
-
-      if (!imei || !clients[imei]) {
-        console.log(`CMD ${data.type} per ${bikeId}: offline`);
-        return;
-      }
-
-      const atCmd = buildAtCmd(data.type);
+      if (!imei || !clients[imei]) return;
+      const atCmd = buildAtCmd(change.doc.data().type);
       if (!atCmd) return;
-
       setTimeout(async () => {
         try {
           const fresh = await change.doc.ref.get();
           if (fresh.data()?.status !== 'pending') return;
-          console.log(`⚡ IMMEDIATO ${data.type} → ${bikeId}`);
+          console.log(`⚡ IMMEDIATO ${change.doc.data().type} → ${bikeId}`);
           clients[imei].write(atCmd);
           await change.doc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
-        } catch(e) { console.error('Errore invio immediato:', e.message); }
+        } catch(e) { console.error('watchCommands send:', e.message); }
       }, 200);
     });
   }, err => console.error('watchCommands error:', err.message));
 }
 
 server.listen(TCP_PORT, () => {
-  console.log(`Server TCP porta ${TCP_PORT}`);
+  console.log(`TCP IoT porta ${TCP_PORT}`);
   watchCommands();
   autoLockInactive();
 });
 
 async function autoLockInactive() {
-  const CHECK_INTERVAL = 30 * 60 * 1000;
-  const LOCK_AFTER_MS = 4 * 60 * 60 * 1000;
   const check = async () => {
     try {
       const snap = await db.collection('bikesStatus').get();
@@ -259,17 +349,17 @@ async function autoLockInactive() {
         const data = doc.data();
         if (data.inUse) continue;
         const elapsed = Date.now() - (data.updatedAt ? new Date(data.updatedAt).getTime() : 0);
-        if (elapsed > LOCK_AFTER_MS) {
+        if (elapsed > 4 * 60 * 60 * 1000) {
           const pedId = 'PED' + doc.id.replace('PA-','');
           const bikeDoc = await db.collection('bikes').doc(pedId).get();
-          const bData = bikeDoc.data();
-          if (bData?.imei && clients[bData.imei]) {
-            console.log(`🔒 Auto-lock ${doc.id}`);
-            clients[bData.imei].write(buildAtCmd('lock'));
+          const imei = bikeDoc.data()?.imei;
+          if (imei && clients[imei]) {
+            console.log(`🔒 Auto-blocco ${doc.id}`);
+            clients[imei].write(buildAtCmd('lock'));
           }
         }
       }
-    } catch(e) { console.error('autoLock error:', e.message); }
+    } catch(e) { console.error('autoLock:', e.message); }
   };
-  setTimeout(() => { check(); setInterval(check, CHECK_INTERVAL); }, 5 * 60 * 1000);
+  setTimeout(() => { check(); setInterval(check, 30 * 60 * 1000); }, 5 * 60 * 1000);
 }

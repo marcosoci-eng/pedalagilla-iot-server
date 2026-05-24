@@ -5,7 +5,11 @@ const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: ["https://pedalagilla.it", "https://www.pedalagilla.it", "https://pedalagilla-app.vercel.app"],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
 app.use(express.json());
 
 // Endpoint per creare PaymentIntent

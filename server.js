@@ -6,10 +6,13 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 app.use(cors({
-  origin: ["https://pedalagilla.it", "https://www.pedalagilla.it", "https://pedalagilla-app.vercel.app"],
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"]
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  preflightContinue: false,
+  optionsSuccessStatus: 204
 }));
+app.options('*', cors()); // Gestione esplicita preflight
 app.use(express.json());
 
 // Endpoint per creare PaymentIntent

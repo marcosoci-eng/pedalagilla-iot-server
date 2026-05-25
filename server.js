@@ -224,9 +224,11 @@ async function handleMessage(msg, socket, setImei) {
 async function checkPendingCommands(bikeId, imei, socket) {
   try {
     const cmdRef = db.collection('bikes').doc(bikeId).collection('commands');
-    const allCmds = await cmdRef.orderBy('createdAt', 'desc').limit(10).get();
-    const pendingDoc = allCmds.docs.find(d => d.data().status === 'pending');
-    if (!pendingDoc) return;
+    // Process ALL pending commands in order, not just the first one
+    const allCmds = await cmdRef.orderBy('createdAt', 'asc').get();
+    const pendingDocs = allCmds.docs.filter(d => d.data().status === 'pending');
+    if (pendingDocs.length === 0) return;
+    const pendingDoc = pendingDocs[0]; // Process oldest first
     const cmd = pendingDoc.data();
     let atCmd = '';
     if (cmd.type === 'unlock') {

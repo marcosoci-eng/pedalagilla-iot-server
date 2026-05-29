@@ -243,7 +243,7 @@ async function checkPendingCommands(bikeId, imei, socket) {
     }
     // Process ALL pending commands in order, not just the first one
     const freshCmds = await cmdRef.orderBy('createdAt', 'asc').get();
-    const pendingDocs = freshCmds.docs.filter(d => d.data().status === 'pending');
+    const pendingDocs = freshCmds.docs.filter(d => d.data().status === 'pending' && d.data().status !== 'cancelled');
     if (pendingDocs.length === 0) return;
     const pendingDoc = pendingDocs[0]; // Process oldest first
     const cmd = pendingDoc.data();

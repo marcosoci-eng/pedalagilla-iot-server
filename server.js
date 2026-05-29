@@ -224,9 +224,19 @@ async function handleMessage(msg, socket, setImei) {
 async function checkPendingCommands(bikeId, imei, socket) {
   try {
     const cmdRef = db.collection('bikes').doc(bikeId).collection('commands');
-    // Process ALL pending commands in order, not just the first one
+    // Pulisci comandi vecchi (> 2 ore) per evitare code stantie
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
     const allCmds = await cmdRef.orderBy('createdAt', 'asc').get();
-    const pendingDocs = allCmds.docs.filter(d => d.data().status === 'pending');
+    for (const d of allCmds.docs) {
+      const data = d.data();
+      if ((data.status === 'pending' || data.status === 'sent') && data.createdAt < twoHoursAgo) {
+        await d.ref.delete();
+        console.log(`🗑️ Comando stantio eliminato: ${bikeId} ${data.type} (${data.createdAt})`);
+      }
+    }
+    // Process ALL pending commands in order, not just the first one
+    const freshCmds = await cmdRef.orderBy('createdAt', 'asc').get();
+    const pendingDocs = freshCmds.docs.filter(d => d.data().status === 'pending');
     if (pendingDocs.length === 0) return;
     const pendingDoc = pendingDocs[0]; // Process oldest first
     const cmd = pendingDoc.data();

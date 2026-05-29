@@ -224,14 +224,21 @@ async function handleMessage(msg, socket, setImei) {
 async function checkPendingCommands(bikeId, imei, socket) {
   try {
     const cmdRef = db.collection('bikes').doc(bikeId).collection('commands');
-    // Pulisci comandi vecchi (> 2 ore) per evitare code stantie
-    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    const allCmds = await cmdRef.orderBy('createdAt', 'asc').get();
-    for (const d of allCmds.docs) {
-      const data = d.data();
-      if ((data.status === 'pending' || data.status === 'sent') && data.createdAt < twoHoursAgo) {
-        await d.ref.delete();
-        console.log(`🗑️ Comando stantio eliminato: ${bikeId} ${data.type} (${data.createdAt})`);
+    // Pulisci comandi vecchi SOLO se la bici non è in uso (evita di cancellare unlock durante corsa)
+    const paId = 'PA-' + bikeId.replace('PED','');
+    const statusDoc = await db.collection('bikesStatus').doc(paId).get();
+    const bikeInUse = statusDoc.exists && statusDoc.data().inUse;
+    if (!bikeInUse) {
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+      const staleCmds = await cmdRef.orderBy('createdAt', 'asc').get();
+      for (const d of staleCmds.docs) {
+        const data = d.data();
+        // Elimina solo lock/gps_normal/gps_high vecchi — MAI unlock (potrebbe servire ancora)
+        const safeToDelete = ['lock','gps_normal','gps_high','beep','battery_open'];
+        if (safeToDelete.includes(data.type) && (data.status === 'pending' || data.status === 'sent') && data.createdAt < twoHoursAgo) {
+          await d.ref.delete();
+          console.log(`🗑️ Comando stantio eliminato: ${bikeId} ${data.type}`);
+        }
       }
     }
     // Process ALL pending commands in order, not just the first one

@@ -56,7 +56,9 @@ app.post('/create-pre-auth', async (req, res) => {
   }
 });
 
-const HTTP_PORT = process.env.HTTP_PORT || 3000;
+// Porta HTTP FISSA a 3000: corrisponde al dominio HTTP di Railway (web-...railway.app -> Port 3000).
+// NON usare process.env.HTTP_PORT/PORT perché su Railway può valere 8020 e collidere col TCP.
+const HTTP_PORT = 3000;
 app.listen(HTTP_PORT, () => console.log(`✅ HTTP server on port ${HTTP_PORT}`));
 
 
@@ -67,9 +69,8 @@ const db = admin.firestore();
 
 const PASSWORD = process.env.DEVICE_PASSWORD || 'nabe5';
 // IMPORTANTE: il TCP proxy di Railway inoltra l'esterno (es. :45415) -> porta interna :8020.
-// Il server TCP DEVE ascoltare su 8020 (target del proxy), NON su process.env.PORT
-// (che Railway usa per l'HTTP e vale 3000). Usa TCP_PORT solo come override esplicito.
-const TCP_PORT = process.env.TCP_PORT || 8020;
+// Porta TCP FISSA a 8020 (target del proxy). Diversa dalla HTTP (3000), così non collidono mai.
+const TCP_PORT = 8020;
 
 // Mappa IMEI -> ID bici
 const IMEI_MAP = {

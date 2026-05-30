@@ -56,6 +56,42 @@ app.post('/create-pre-auth', async (req, res) => {
   }
 });
 
+// Cattura l'importo reale da una pre-autorizzazione a fine corsa.
+// Se l'importo reale e' inferiore all'hold, Stripe cattura solo quello e rilascia il resto.
+// Se l'importo e' sotto il minimo (0.50), annulla l'hold senza addebitare.
+app.post('/capture-payment', async (req, res) => {
+  try {
+    const { paymentIntentId, amount } = req.body;
+    if (!paymentIntentId) return res.status(400).json({ error: 'paymentIntentId mancante' });
+    const cents = Math.round((amount || 0) * 100);
+    // Importo troppo basso per addebitare: annulla l'autorizzazione (rilascia l'hold)
+    if (cents < 50) {
+      await stripe.paymentIntents.cancel(paymentIntentId);
+      return res.json({ success: true, captured: 0, cancelled: true });
+    }
+    const captured = await stripe.paymentIntents.capture(paymentIntentId, {
+      amount_to_capture: cents
+    });
+    res.json({ success: true, captured: cents / 100, paymentIntentId: captured.id });
+  } catch(e) {
+    console.error('capture-payment error:', e.message);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Annulla una pre-autorizzazione (rilascia l'hold senza addebitare)
+app.post('/cancel-preauth', async (req, res) => {
+  try {
+    const { paymentIntentId } = req.body;
+    if (!paymentIntentId) return res.status(400).json({ error: 'paymentIntentId mancante' });
+    await stripe.paymentIntents.cancel(paymentIntentId);
+    res.json({ success: true });
+  } catch(e) {
+    console.error('cancel-preauth error:', e.message);
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // Porta HTTP FISSA a 3000: corrisponde al dominio HTTP di Railway (web-...railway.app -> Port 3000).
 // NON usare process.env.HTTP_PORT/PORT perché su Railway può valere 8020 e collidere col TCP.
 const HTTP_PORT = 3000;

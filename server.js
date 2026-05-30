@@ -66,7 +66,10 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const PASSWORD = process.env.DEVICE_PASSWORD || 'nabe5';
-const TCP_PORT = process.env.PORT || 8020;
+// IMPORTANTE: il TCP proxy di Railway inoltra l'esterno (es. :45415) -> porta interna :8020.
+// Il server TCP DEVE ascoltare su 8020 (target del proxy), NON su process.env.PORT
+// (che Railway usa per l'HTTP e vale 3000). Usa TCP_PORT solo come override esplicito.
+const TCP_PORT = process.env.TCP_PORT || 8020;
 
 // Mappa IMEI -> ID bici
 const IMEI_MAP = {
@@ -296,7 +299,8 @@ function watchCommands() {
 }
 
 server.listen(TCP_PORT, () => {
-  console.log(`Server TCP in ascolto sulla porta ${TCP_PORT}`);
+  console.log(`✅ Server TCP in ascolto sulla porta ${TCP_PORT}`);
+  console.log(`   (Railway TCP proxy deve puntare a questa porta: shuttle.proxy.rlwy.net:XXXXX -> :${TCP_PORT})`);
   watchCommands();
   autoLockInactive();
 });

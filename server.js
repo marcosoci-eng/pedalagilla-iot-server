@@ -305,8 +305,8 @@ async function checkPendingCommands(bikeId, imei, socket) {
       // Ritorna a frequenza normale: ogni 30 secondi
       atCmd = `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;
     } else if (cmd.type === 'gps_standby') {
-      // Risparmio batteria: report ogni 600 secondi (10 min) quando la bici è ferma/standby
-      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,600,240,,,,,,FFFF$`;
+      // Risparmio batteria (attivazione manuale): report ogni 300 secondi (5 min)
+      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,300,240,,,,,,FFFF$`;
     }
     if (atCmd) {
       console.log(`Invio comando ${cmd.type} a ${bikeId}:`, atCmd);

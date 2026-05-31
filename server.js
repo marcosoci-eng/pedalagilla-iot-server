@@ -274,7 +274,7 @@ async function checkPendingCommands(bikeId, imei, socket) {
       for (const d of staleCmds.docs) {
         const data = d.data();
         // Elimina solo lock/gps_normal/gps_high vecchi — MAI unlock (potrebbe servire ancora)
-        const safeToDelete = ['lock','gps_normal','gps_high','beep','battery_open'];
+        const safeToDelete = ['lock','gps_normal','gps_high','gps_standby','beep','battery_open'];
         if (safeToDelete.includes(data.type) && (data.status === 'pending' || data.status === 'sent') && data.createdAt < twoHoursAgo) {
           await d.ref.delete();
           console.log(`🗑️ Comando stantio eliminato: ${bikeId} ${data.type}`);
@@ -304,6 +304,9 @@ async function checkPendingCommands(bikeId, imei, socket) {
     } else if (cmd.type === 'gps_normal') {
       // Ritorna a frequenza normale: ogni 30 secondi
       atCmd = `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;
+    } else if (cmd.type === 'gps_standby') {
+      // Risparmio batteria: report ogni 300 secondi (5 min) quando la bici è ferma/standby
+      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,300,240,,,,,,FFFF$`;
     }
     if (atCmd) {
       console.log(`Invio comando ${cmd.type} a ${bikeId}:`, atCmd);

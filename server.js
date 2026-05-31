@@ -293,8 +293,8 @@ async function checkPendingCommands(bikeId, imei, socket) {
         case 'lock': return `AT+GTRTO=${PASSWORD},16,,,,,,,,FFFF$`;
         case 'beep': return `AT+GTRTO=${PASSWORD},11,,,,,,,,FFFF$`;
         case 'battery_open': return `AT+GTRTO=${PASSWORD},21,,0,,,,,,FFFF$`;
-        case 'gps_high': return `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;   // corsa: ogni 30s
-        case 'gps_normal': return `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`; // reattivo: ogni 30s
+        case 'gps_high': return `AT+GTFRI=${PASSWORD},1,0,300,60,240,,,,,,FFFF$`;   // corsa: ogni 60s (valore originale)
+        case 'gps_normal': return `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`; // riposo/idle: ogni 30s
         case 'gps_standby': return `AT+GTFRI=${PASSWORD},1,0,300,300,240,,,,,,FFFF$`; // risparmio: ogni 5 min
         default: return '';
       }

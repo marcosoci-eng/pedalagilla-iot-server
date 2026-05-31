@@ -285,33 +285,32 @@ async function checkPendingCommands(bikeId, imei, socket) {
     const freshCmds = await cmdRef.orderBy('createdAt', 'asc').get();
     const pendingDocs = freshCmds.docs.filter(d => d.data().status === 'pending' && d.data().status !== 'cancelled');
     if (pendingDocs.length === 0) return;
-    const pendingDoc = pendingDocs[0]; // Process oldest first
-    const cmd = pendingDoc.data();
-    let atCmd = '';
-    if (cmd.type === 'unlock') {
-      atCmd = `AT+GTRTO=${PASSWORD},15,,,,,,,,FFFF$`;
-    } else if (cmd.type === 'lock') {
-      atCmd = `AT+GTRTO=${PASSWORD},16,,,,,,,,FFFF$`;
-    } else if (cmd.type === 'beep') {
-      // Comando corretto confermato da Navee
-      atCmd = `AT+GTRTO=${PASSWORD},11,,,,,,,,FFFF$`;
-    } else if (cmd.type === 'battery_open') {
-      // Comando corretto confermato da Navee (era 12, corretto è 21)
-      atCmd = `AT+GTRTO=${PASSWORD},21,,0,,,,,,FFFF$`;
-    } else if (cmd.type === 'gps_high') {
-      // Alta frequenza GPS durante la corsa: report ogni 30 secondi (rientro area più reattivo)
-      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;
-    } else if (cmd.type === 'gps_normal') {
-      // Ritorna a frequenza normale: ogni 30 secondi
-      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;
-    } else if (cmd.type === 'gps_standby') {
-      // Risparmio batteria (attivazione manuale): report ogni 300 secondi (5 min)
-      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,300,240,,,,,,FFFF$`;
-    }
-    if (atCmd) {
-      console.log(`Invio comando ${cmd.type} a ${bikeId}:`, atCmd);
-      socket.write(atCmd);
-      await pendingDoc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
+    // Svuota TUTTA la coda in ordine cronologico: così il blocco finale arriva sempre,
+    // anche se dietro a comandi precedenti (es. sblocco/beep del geofence). L'ultimo in ordine vince.
+    const buildAt = (type) => {
+      switch (type) {
+        case 'unlock': return `AT+GTRTO=${PASSWORD},15,,,,,,,,FFFF$`;
+        case 'lock': return `AT+GTRTO=${PASSWORD},16,,,,,,,,FFFF$`;
+        case 'beep': return `AT+GTRTO=${PASSWORD},11,,,,,,,,FFFF$`;
+        case 'battery_open': return `AT+GTRTO=${PASSWORD},21,,0,,,,,,FFFF$`;
+        case 'gps_high': return `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;   // corsa: ogni 30s
+        case 'gps_normal': return `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`; // reattivo: ogni 30s
+        case 'gps_standby': return `AT+GTFRI=${PASSWORD},1,0,300,300,240,,,,,,FFFF$`; // risparmio: ogni 5 min
+        default: return '';
+      }
+    };
+    for (const pdoc of pendingDocs) {
+      const cmd = pdoc.data();
+      const atCmd = buildAt(cmd.type);
+      if (atCmd) {
+        console.log(`Invio comando ${cmd.type} a ${bikeId}:`, atCmd);
+        socket.write(atCmd);
+        await pdoc.ref.update({ status: 'sent', sentAt: new Date().toISOString() });
+        await new Promise(r => setTimeout(r, 250)); // piccola pausa tra un comando e l'altro
+      } else {
+        // Tipo sconosciuto: marca come sent per non bloccare la coda
+        await pdoc.ref.update({ status: 'sent', sentAt: new Date().toISOString(), note: 'tipo sconosciuto' });
+      }
     }
   } catch (e) {
     console.error('Errore comando:', e.message);

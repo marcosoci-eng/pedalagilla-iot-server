@@ -299,8 +299,8 @@ async function checkPendingCommands(bikeId, imei, socket) {
       // Comando corretto confermato da Navee (era 12, corretto è 21)
       atCmd = `AT+GTRTO=${PASSWORD},21,,0,,,,,,FFFF$`;
     } else if (cmd.type === 'gps_high') {
-      // Alta frequenza GPS: ogni 60 secondi in movimento (meno beep)
-      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,60,240,,,,,,FFFF$`;
+      // Alta frequenza GPS durante la corsa: report ogni 30 secondi (rientro area più reattivo)
+      atCmd = `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;
     } else if (cmd.type === 'gps_normal') {
       // Ritorna a frequenza normale: ogni 30 secondi
       atCmd = `AT+GTFRI=${PASSWORD},1,0,300,30,240,,,,,,FFFF$`;

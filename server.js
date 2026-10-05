@@ -29,8 +29,15 @@ app.post('/create-payment-intent', async (req, res) => {
       automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
       metadata: { bikeId, plan, userId, userName }
     });
-    
-    res.json({ success: true, paymentIntentId: paymentIntent.id });
+    // 3D Secure/SCA: la carta richiede autenticazione → NON è un pagamento valido finché il cliente non la completa.
+    if (paymentIntent.status === 'requires_action') {
+      return res.json({ requires_action: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+    }
+    // Pagamento valido solo se davvero riuscito/autorizzato.
+    if (paymentIntent.status === 'succeeded' || paymentIntent.status === 'requires_capture') {
+      return res.json({ success: true, paymentIntentId: paymentIntent.id });
+    }
+    return res.json({ success: false, error: 'Pagamento non riuscito (' + paymentIntent.status + ')' });
   } catch(e) {
     console.error('Stripe error:', e.message);
     res.status(400).json({ error: e.message });
@@ -50,7 +57,15 @@ app.post('/create-pre-auth', async (req, res) => {
       automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
       metadata: { bikeIds: bikeIds?.join(',') }
     });
-    res.json({ success: true, paymentIntentId: paymentIntent.id });
+    // 3D Secure/SCA: hold NON valido finché il cliente non completa l'autenticazione.
+    if (paymentIntent.status === 'requires_action') {
+      return res.json({ requires_action: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+    }
+    // Hold valido solo se autorizzato davvero.
+    if (paymentIntent.status === 'requires_capture' || paymentIntent.status === 'succeeded') {
+      return res.json({ success: true, paymentIntentId: paymentIntent.id });
+    }
+    return res.json({ success: false, error: 'Pre-autorizzazione non riuscita (' + paymentIntent.status + ')' });
   } catch(e) {
     res.status(400).json({ error: e.message });
   }
